@@ -1,0 +1,59 @@
+# macOS / IDE
+.DS_Store
+.cursor/
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# Project artifacts (large or sensitive)
+checkpoints/
+data/
+models/
+hf_release/
+wandb/
+logs/
+
+# Server / playground / API stuff -- belongs in separate repos
+playground/
+src/server.py
+src/inference.py
+requirements-server.txt
+Dockerfile
+
+# Older / unrelated source files (Phase 0-2 artifacts not part of the
+# Phase 4-9 published work; intentionally left out of the public repo).
+src/clean_data.py
+src/harvester.py
+src/new_urls.py
+src/prepare_dataset.py
+src/prepare_grpo_data.py
+src/prepare_grpo_v2.py
+src/eval_checkpoint.py
+src/train_grpo.py
+src/train_icon_sft.py
+src/train_student.py
+src/cursor_smoke.py
+src/cursor_rollout_smoke.py
+src/cursor_vlm_smoke.py
+src/grpo_rewards.py
+src/mine_hard_icons.py
+
+# Notebooks + internal planning docs
+*.ipynb
+gui-grounding-plan.md
+
+# OS / env
+.env
+.venv/
+venv/
+*.log
+*.tmp

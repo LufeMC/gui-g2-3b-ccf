@@ -1,0 +1,21 @@
+# Core inference + eval (always required)
+torch>=2.4.0
+transformers==4.49.0
+qwen-vl-utils==0.0.14
+Pillow>=10.0.0
+tqdm
+
+# Training scripts (only needed if you're running train_bbox_sft.py /
+# train_cursor_grpo.py / train_cursor_sft.py; safe to skip for CCF + eval)
+peft==0.13.2
+accelerate>=0.30.0
+
+# Optional but strongly recommended for big-image speedup. Install
+# separately to match your torch version:
+#   pip install flash-attn==2.7.0.post2 --no-build-isolation
+
+# Optional logging
+wandb
+
+# Tests
+pytest
