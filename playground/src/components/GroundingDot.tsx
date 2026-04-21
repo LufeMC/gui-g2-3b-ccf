@@ -5,9 +5,15 @@ interface GroundingDotProps {
   y: number;
   confidence: number;
   imgBounds: { left: number; top: number; width: number; height: number };
+  /**
+   * If true, render the dot in a "tentative" style -- slightly lighter
+   * and faster pulse -- to convey that this is the streaming coarse
+   * prediction and the refined version is still loading.
+   */
+  tentative?: boolean;
 }
 
-export function GroundingDot({ x, y, confidence, imgBounds }: GroundingDotProps) {
+export function GroundingDot({ x, y, confidence, imgBounds, tentative }: GroundingDotProps) {
   const isLow = confidence < 0.8;
 
   const pixelLeft = imgBounds.left + x * imgBounds.width;
@@ -16,12 +22,18 @@ export function GroundingDot({ x, y, confidence, imgBounds }: GroundingDotProps)
 
   return (
     <div
-      className="absolute w-[18px] h-[18px] rounded-full -translate-x-1/2 -translate-y-1/2 pointer-events-none z-10"
+      className={cn(
+        "absolute w-[18px] h-[18px] rounded-full -translate-x-1/2 -translate-y-1/2 pointer-events-none z-10 transition-all duration-200",
+        tentative ? "opacity-70" : "opacity-100",
+      )}
       style={{ left: `${pixelLeft}px`, top: `${pixelTop}px` }}
     >
       <span
         className={cn(
-          "absolute inset-0 rounded-full animate-[pulse_1.8s_ease-in-out_infinite]",
+          "absolute inset-0 rounded-full",
+          tentative
+            ? "animate-[pulse_0.9s_ease-in-out_infinite]"
+            : "animate-[pulse_1.8s_ease-in-out_infinite]",
           isLow
             ? "bg-accent-orange shadow-[0_0_0_3px_rgba(230,138,25,0.3)]"
             : "bg-accent shadow-[0_0_0_3px_rgba(230,59,25,0.3)]",
@@ -35,7 +47,7 @@ export function GroundingDot({ x, y, confidence, imgBounds }: GroundingDotProps)
           top: showBelow ? "calc(100% + 8px)" : "auto",
         }}
       >
-        ({x}, {y})
+        ({x}, {y}){tentative ? " · coarse" : ""}
         <span
           className="absolute left-1/2 -translate-x-1/2 border-4 border-transparent"
           style={

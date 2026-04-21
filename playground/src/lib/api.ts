@@ -1,4 +1,5 @@
 export type GroundingMode = "fast" | "accurate";
+export type GroundingStage = "coarse" | "refined";
 
 export interface GroundingResult {
   x: number;
@@ -8,7 +9,28 @@ export interface GroundingResult {
   mode: GroundingMode;
   n_passes: number;
   agreement_px: number;
+  stage?: GroundingStage; // present when result came from the streaming endpoint
 }
+
+export interface CoarseStageEvent {
+  stage: "coarse";
+  x: number;
+  y: number;
+  latency_ms: number;
+}
+
+export interface RefinedStageEvent {
+  stage: "refined";
+  x: number;
+  y: number;
+  confidence: number;
+  latency_ms: number;
+  mode: GroundingMode;
+  n_passes: number;
+  agreement_px: number;
+}
+
+export type GroundingStreamEvent = CoarseStageEvent | RefinedStageEvent;
 
 const API_BASE = import.meta.env.VITE_API_URL ?? "";
 
@@ -70,6 +92,82 @@ export async function groundImage(
 
   if (!res.ok) throw new Error(`API error: ${res.status}`);
   return res.json();
+}
+
+/**
+ * Streaming variant of groundImage. Calls onEvent twice:
+ *   1. With a "coarse" event as soon as the coarse CCF pass returns
+ *      (~250-500ms server time). Use this to render a tentative dot.
+ *   2. With a "refined" event when the second CCF pass completes
+ *      (~700-900ms). Use this to snap to the final dot.
+ *
+ * Only used in fast mode -- accurate mode runs through the regular
+ * /v1/ground endpoint.
+ */
+export async function groundImageStream(
+  imageBase64: string,
+  instruction: string,
+  onEvent: (event: GroundingStreamEvent) => void,
+): Promise<void> {
+  if (shouldMock()) {
+    return mockGroundingStream(onEvent);
+  }
+
+  const res = await fetch(`${API_BASE}/v1/ground/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image: imageBase64, instruction, mode: "fast" }),
+  });
+
+  if (!res.ok || !res.body) throw new Error(`Stream API error: ${res.status}`);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    // SSE messages are separated by \n\n. Each message has lines like:
+    //   event: coarse
+    //   data: {"x": ...}
+    let sep: number;
+    while ((sep = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, sep);
+      buffer = buffer.slice(sep + 2);
+      const dataLine = block.split("\n").find((l) => l.startsWith("data: "));
+      if (!dataLine) continue;
+      try {
+        const payload = JSON.parse(dataLine.slice(6)) as GroundingStreamEvent;
+        onEvent(payload);
+      } catch {
+        // ignore malformed line
+      }
+    }
+  }
+}
+
+async function mockGroundingStream(
+  onEvent: (event: GroundingStreamEvent) => void,
+): Promise<void> {
+  // Simulate the perceived behavior: coarse at ~400ms, refined at ~900ms
+  await new Promise((r) => setTimeout(r, 350 + Math.random() * 100));
+  const cx = 0.45 + Math.random() * 0.1;
+  const cy = 0.45 + Math.random() * 0.1;
+  onEvent({ stage: "coarse", x: cx, y: cy, latency_ms: 350 });
+  await new Promise((r) => setTimeout(r, 450 + Math.random() * 150));
+  onEvent({
+    stage: "refined",
+    x: cx + (Math.random() - 0.5) * 0.02,
+    y: cy + (Math.random() - 0.5) * 0.02,
+    confidence: 0.95,
+    latency_ms: 850,
+    mode: "fast",
+    n_passes: 2,
+    agreement_px: 4.2,
+  });
 }
 
 export async function joinWaitlist(data: {

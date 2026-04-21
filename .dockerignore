@@ -16,7 +16,6 @@ logs
 wandb
 hf_release
 benchmarks
-tests
 docs
 *.log
 *.tmp

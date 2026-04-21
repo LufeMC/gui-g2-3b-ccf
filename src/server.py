@@ -15,6 +15,7 @@ Environment variables:
 """
 
 import argparse
+import asyncio
 import base64
 import json
 import os
@@ -26,7 +27,7 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from PIL import Image
@@ -112,25 +113,32 @@ async def health():
     )
 
 
-@app.post("/v1/ground", response_model=GroundResponse)
-async def ground(req: GroundRequest):
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
+def _decode_request_image(req: "GroundRequest") -> Image.Image:
     try:
         image_data = req.image
         if "," in image_data:
             image_data = image_data.split(",", 1)[1]
         raw = base64.b64decode(image_data)
-        image = Image.open(BytesIO(raw)).convert("RGB")
+        return Image.open(BytesIO(raw)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
+
+@app.post("/v1/ground", response_model=GroundResponse)
+async def ground(req: GroundRequest):
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
     if not req.instruction.strip():
         raise HTTPException(status_code=400, detail="Instruction cannot be empty")
 
+    image = _decode_request_image(req)
     mode = req.mode or "fast"
-    result = engine.predict(image, req.instruction.strip(), mode=mode)
+    # Run blocking inference off the asyncio thread so the event loop
+    # stays responsive (Container Apps multiplexes other healthchecks
+    # on the same loop).
+    result = await asyncio.to_thread(
+        engine.predict, image, req.instruction.strip(), mode,
+    )
 
     return GroundResponse(
         x=result.x,
@@ -140,6 +148,69 @@ async def ground(req: GroundRequest):
         mode=result.mode,
         n_passes=result.n_passes,
         agreement_px=result.agreement_px,
+    )
+
+
+@app.post("/v1/ground/stream")
+async def ground_stream(req: GroundRequest):
+    """Server-Sent Events endpoint: emits the coarse CCF prediction as
+    soon as it's ready (~300-500ms warm), then the refined prediction
+    when the second pass completes (~600-800ms warm). The playground
+    uses this to render a tentative dot at coarse latency and snap to
+    the refined dot at full latency, so the UX feels sub-1s even when
+    actual server work is closer to 1s.
+
+    Always emits two events: `coarse` then `refined`. On parse failure
+    in the coarse pass we still emit a `refined` event with confidence=0
+    so the client knows to stop waiting."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not req.instruction.strip():
+        raise HTTPException(status_code=400, detail="Instruction cannot be empty")
+
+    image = _decode_request_image(req)
+    instruction = req.instruction.strip()
+
+    async def generator():
+        # Stage 1: coarse pass
+        coarse = await asyncio.to_thread(
+            engine.predict_coarse_only, image, instruction,
+        )
+        if coarse is not None:
+            payload = {
+                "stage": "coarse",
+                "x": coarse.x,
+                "y": coarse.y,
+                "latency_ms": coarse.coarse_latency_ms,
+            }
+            yield f"event: coarse\ndata: {json.dumps(payload)}\n\n"
+
+        # Stage 2: refined pass (always emitted)
+        refined = await asyncio.to_thread(
+            engine.predict_refined_from_coarse, image, instruction, coarse,
+        )
+        payload = {
+            "stage": "refined",
+            "x": refined.x,
+            "y": refined.y,
+            "confidence": refined.confidence,
+            "latency_ms": refined.latency_ms,
+            "mode": refined.mode,
+            "n_passes": refined.n_passes,
+            "agreement_px": refined.agreement_px,
+        }
+        yield f"event: refined\ndata: {json.dumps(payload)}\n\n"
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            # Tell intermediaries (Azure proxy, browser, CDN) not to
+            # buffer or compress; SSE depends on flushing per chunk.
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -168,12 +239,13 @@ playground_dist = Path(__file__).parent.parent / "playground" / "dist"
 if playground_dist.is_dir():
     app.mount("/assets", StaticFiles(directory=playground_dist / "assets"), name="assets")
 
-    @app.get("/{path:path}")
-    async def serve_spa(path: str):
-        # Don't shadow API routes
-        if path.startswith(("v1/", "health", "docs", "openapi.json")):
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        # Don't shadow API routes (POSTs to /v1/* are handled above; GETs to
+        # /v1/* would have nothing to render anyway).
+        if full_path.startswith(("v1/", "health", "docs", "openapi.json")):
             raise HTTPException(status_code=404, detail="Not found")
-        file_path = playground_dist / path
+        file_path = playground_dist / full_path
         if file_path.is_file():
             return FileResponse(file_path)
         return FileResponse(playground_dist / "index.html")

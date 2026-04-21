@@ -72,17 +72,31 @@ export function AnnotatedCanvas({ image, result, loading }: AnnotatedCanvasProps
               y={result.y}
               confidence={result.confidence}
               imgBounds={imgBounds}
+              tentative={result.stage === "coarse"}
             />
           )}
         </>
       )}
 
-      {loading && (
+      {/*
+        Two loading states:
+          - Full-screen spinner: no result yet (waiting for coarse pass).
+          - Tiny "Refining..." pill: we have a coarse dot already, just
+            waiting for the refined snap. Doesn't cover the dot so the
+            user sees their answer immediately.
+      */}
+      {loading && !result && (
         <div className="absolute inset-0 flex items-center justify-center bg-bg-card/80 backdrop-blur-sm rounded-[var(--radius-lg)]">
           <div className="flex items-center gap-2 font-mono text-[0.78rem] text-text-secondary">
             <div className="w-[15px] h-[15px] border-2 border-border border-t-accent rounded-full animate-[spin_0.7s_linear_infinite]" />
             Running inference&hellip;
           </div>
+        </div>
+      )}
+      {loading && result?.stage === "coarse" && (
+        <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-bg-card/90 border border-border shadow-sm flex items-center gap-1.5 font-mono text-[0.65rem] text-text-secondary">
+          <div className="w-[10px] h-[10px] border-2 border-border border-t-accent rounded-full animate-[spin_0.7s_linear_infinite]" />
+          Refining&hellip;
         </div>
       )}
     </div>

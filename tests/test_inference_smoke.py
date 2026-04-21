@@ -59,11 +59,30 @@ def test_inference_imports_and_helpers():
     assert centroid == (0.0, 0.0) and voters == []
 
 
+def test_smart_resize_and_crop_helpers():
+    """Pure-Python qwen_vl_utils.smart_resize parity + CCF crop window."""
+    import inference
+
+    new_h, new_w = inference._smart_resize(1080, 1920, max_pixels=1_000_000)
+    assert (new_h * new_w) <= 1_000_000
+    assert new_h % 28 == 0 and new_w % 28 == 0
+    assert abs((new_w / new_h) - (1920 / 1080)) < 0.1
+
+    new_h, new_w = inference._smart_resize(10, 10, max_pixels=1_000_000)
+    assert (new_h * new_w) >= inference.DEFAULT_MIN_PIXELS
+
+    win = inference._compute_crop_window((500, 500), (1000, 1000))
+    assert win[0] >= 0 and win[1] >= 0
+    assert win[2] <= 1000 and win[3] <= 1000
+    assert win[2] - win[0] > 0 and win[3] - win[1] > 0
+
+
 def test_server_route_with_stub_engine():
     """FastAPI route accepts the new request and returns the new response.
 
     We monkeypatch the module's `engine` global to a stub so the route
-    returns deterministic data without loading any model.
+    returns deterministic data without loading any model. Also covers
+    the new SSE streaming endpoint.
     """
     import inference
     import server
@@ -75,6 +94,20 @@ def test_server_route_with_stub_engine():
                 x=0.5, y=0.5, confidence=0.92,
                 latency_ms=42, mode=mode, n_passes=2,
                 agreement_px=3.5, raw_response="[10,10,30,30]",
+            )
+
+        def predict_coarse_only(self, image, instruction):
+            return inference.CoarseResult(
+                x=0.5, y=0.5, abs_x=image.size[0] / 2, abs_y=image.size[1] / 2,
+                raw_response="[10,10,30,30]", coarse_latency_ms=300,
+            )
+
+        def predict_refined_from_coarse(self, image, instruction, coarse):
+            return inference.GroundingResult(
+                x=0.51, y=0.49, confidence=0.95,
+                latency_ms=900, mode="fast", n_passes=2,
+                agreement_px=4.0, raw_response="[10,10,30,30]",
+                coarse_xy=(coarse.abs_x, coarse.abs_y) if coarse else None,
             )
 
     server.engine = StubEngine()
@@ -99,6 +132,17 @@ def test_server_route_with_stub_engine():
         assert key in body, f"missing {key} in {body}"
     assert body["mode"] == "accurate"
 
+    # SSE streaming endpoint: should emit a `coarse` event then a `refined` event
+    res = client.post("/v1/ground/stream", json={
+        "image": _png_b64(), "instruction": "click submit",
+    })
+    assert res.status_code == 200, res.text
+    assert res.headers["content-type"].startswith("text/event-stream")
+    text = res.text
+    assert "event: coarse" in text and "event: refined" in text
+    assert "\"stage\": \"coarse\"" in text
+    assert "\"stage\": \"refined\"" in text
+
     res = client.post("/v1/ground", json={"image": _png_b64(), "instruction": ""})
     assert res.status_code == 400
 
@@ -109,9 +153,11 @@ def test_server_route_with_stub_engine():
 if __name__ == "__main__":
     test_inference_imports_and_helpers()
     print("inference helpers: OK")
+    test_smart_resize_and_crop_helpers()
+    print("smart_resize + crop helpers: OK")
     try:
         test_server_route_with_stub_engine()
-        print("server routes: OK")
+        print("server routes (sync + stream): OK")
     except Exception as e:
         print(f"server route test failed: {e}")
         raise

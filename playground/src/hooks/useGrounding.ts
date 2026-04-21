@@ -1,5 +1,10 @@
 import { useState, useCallback } from "react";
-import { groundImage, type GroundingMode, type GroundingResult } from "@/lib/api";
+import {
+  groundImage,
+  groundImageStream,
+  type GroundingMode,
+  type GroundingResult,
+} from "@/lib/api";
 import type { Example } from "@/lib/examples";
 
 interface GroundingState {
@@ -56,12 +61,52 @@ export function useGrounding() {
     setState((s) => ({ ...s, loading: true, result: null }));
 
     try {
-      const result = await groundImage(
-        state.image,
-        state.instruction,
-        state.mode,
-      );
-      setState((s) => ({ ...s, result, loading: false }));
+      // Fast mode: stream so the UI can render the coarse dot at
+      // ~400ms before the refined pass completes (~900ms). Accurate
+      // mode goes through the regular sync endpoint -- there's no
+      // useful intermediate stage to show for the 6-pass cluster.
+      if (state.mode === "fast") {
+        await groundImageStream(state.image, state.instruction, (event) => {
+          if (event.stage === "coarse") {
+            setState((s) => ({
+              ...s,
+              loading: true, // still loading; refined pass coming
+              result: {
+                x: event.x,
+                y: event.y,
+                confidence: 0.5, // tentative -- refined will overwrite
+                latency_ms: event.latency_ms,
+                mode: "fast",
+                n_passes: 1,
+                agreement_px: 0,
+                stage: "coarse",
+              },
+            }));
+          } else {
+            setState((s) => ({
+              ...s,
+              loading: false,
+              result: {
+                x: event.x,
+                y: event.y,
+                confidence: event.confidence,
+                latency_ms: event.latency_ms,
+                mode: event.mode,
+                n_passes: event.n_passes,
+                agreement_px: event.agreement_px,
+                stage: "refined",
+              },
+            }));
+          }
+        });
+      } else {
+        const result = await groundImage(
+          state.image,
+          state.instruction,
+          state.mode,
+        );
+        setState((s) => ({ ...s, result, loading: false }));
+      }
     } catch {
       setState((s) => ({ ...s, loading: false }));
     }

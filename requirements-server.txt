@@ -1,9 +1,9 @@
+# vLLM official Docker image (vllm/vllm-openai:vX) brings torch +
+# transformers + flash-attn + xformers transitively pinned. We only
+# install the FastAPI-level deps on top of that base image. This file
+# is kept for non-Docker development setups (local venv, RunPod
+# bootstrap), where you would install vllm separately.
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
-transformers==4.49.0
-torch>=2.4.0
-peft>=0.13.0
-accelerate>=0.34.0
-qwen-vl-utils>=0.0.8
 Pillow>=10.0.0
