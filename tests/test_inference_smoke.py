@@ -149,6 +149,22 @@ def test_server_route_with_stub_engine():
     res = client.post("/v1/ground", json={"image": "not-base64$$$", "instruction": "x"})
     assert res.status_code == 400
 
+    # /v1/stats: should count the successful sync + streaming requests above
+    res = client.get("/v1/stats")
+    assert res.status_code == 200, res.text
+    body = res.json()
+    for key in ("now_utc", "uptime_seconds", "buffer_size",
+                "last_1h", "last_24h", "all_time_in_buffer"):
+        assert key in body, f"missing {key} in {body}"
+    # We made one sync (mode=accurate) + one streaming (mode=fast) call
+    # during this test; both should be counted in last_1h.
+    h1 = body["last_1h"]
+    assert h1["total"] >= 2, f"expected >=2 in last_1h, got {h1}"
+    assert h1["unique_visitors"] >= 1
+    assert h1["fast"] >= 1 and h1["accurate"] >= 1
+    assert h1["streaming"] >= 1
+    assert h1["successful"] >= 1
+
 
 if __name__ == "__main__":
     test_inference_imports_and_helpers()

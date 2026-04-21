@@ -17,11 +17,14 @@ Environment variables:
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import smtplib
 import ssl
+import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from io import BytesIO
@@ -68,6 +71,28 @@ GROUND_NOTIFY_TO = os.environ.get("GROUND_NOTIFY_TO", "") or WAITLIST_NOTIFY_TO
 # For a multi-replica setup this would need to move to Redis; we're at
 # min/max=1 replicas so a Python dict is the right call.
 _LAST_NOTIFIED_AT: dict[str, float] = {}
+
+# Bounded ring buffer of recent /v1/ground* requests for the /v1/stats
+# endpoint. Each entry: (epoch_ts, ip_hash, mode, streaming, ok).
+# Cap at 50k entries (~2 weeks at 1500 req/day) to bound memory.
+# IP is hashed before storage so the buffer can't be exfiltrated as a
+# visitor list -- /v1/stats only ever returns counts.
+_RECENT_GROUND: "deque[tuple[float, str, str, bool, bool]]" = deque(maxlen=50_000)
+_STATS_LOCK = threading.Lock()
+_STARTED_AT = time.time()
+
+
+def _ip_hash(ip: str) -> str:
+    """Stable but non-reversible IP identifier for unique-visitor counts.
+    Salted with the process start so different deployments can't be
+    cross-referenced even if logs leak."""
+    h = hashlib.sha256(f"{_STARTED_AT}:{ip}".encode()).hexdigest()
+    return h[:16]
+
+
+def _record_ground(ip: str, mode: str, streaming: bool, ok: bool) -> None:
+    with _STATS_LOCK:
+        _RECENT_GROUND.append((time.time(), _ip_hash(ip), mode, streaming, ok))
 
 
 @asynccontextmanager
@@ -140,6 +165,57 @@ async def health():
     )
 
 
+@app.get("/v1/stats")
+async def stats():
+    """Public counters of recent /v1/ground* activity.
+
+    Only counts are exposed -- IPs are hashed before storage and never
+    leave the process. Useful as a curlable real-time pulse during a
+    launch:
+
+        curl https://<host>/v1/stats | jq
+    """
+    now = time.time()
+    cutoff_24h = now - 86400
+    cutoff_1h = now - 3600
+
+    with _STATS_LOCK:
+        all_entries = list(_RECENT_GROUND)
+
+    def summarize(entries):
+        if not entries:
+            return {
+                "total": 0, "unique_visitors": 0,
+                "fast": 0, "accurate": 0,
+                "streaming": 0, "successful": 0,
+            }
+        return {
+            "total": len(entries),
+            "unique_visitors": len({e[1] for e in entries}),
+            "fast": sum(1 for e in entries if e[2] == "fast"),
+            "accurate": sum(1 for e in entries if e[2] == "accurate"),
+            "streaming": sum(1 for e in entries if e[3]),
+            "successful": sum(1 for e in entries if e[4]),
+        }
+
+    last_24h = [e for e in all_entries if e[0] >= cutoff_24h]
+    last_1h = [e for e in all_entries if e[0] >= cutoff_1h]
+    last_request_at = (
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(all_entries[-1][0]))
+        if all_entries else None
+    )
+
+    return {
+        "now_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "uptime_seconds": int(now - _STARTED_AT),
+        "buffer_size": len(all_entries),
+        "last_request_at": last_request_at,
+        "last_1h": summarize(last_1h),
+        "last_24h": summarize(last_24h),
+        "all_time_in_buffer": summarize(all_entries),
+    }
+
+
 def _decode_request_image(req: "GroundRequest") -> Image.Image:
     try:
         image_data = req.image
@@ -161,12 +237,13 @@ async def ground(req: GroundRequest, request: Request):
     image = _decode_request_image(req)
     mode = req.mode or "fast"
     instruction = req.instruction.strip()
+    visitor_ip = _client_ip(request)
 
     # Notify (off-thread, throttled per IP) so we get a real-time email
     # the first time each visitor exercises the API in a session.
     asyncio.create_task(asyncio.to_thread(
         _maybe_notify_ground,
-        _client_ip(request),
+        visitor_ip,
         instruction,
         mode,
         False,
@@ -177,6 +254,9 @@ async def ground(req: GroundRequest, request: Request):
     # stays responsive (Container Apps multiplexes other healthchecks
     # on the same loop).
     result = await asyncio.to_thread(engine.predict, image, instruction, mode)
+
+    # Record for /v1/stats (a successful prediction returns confidence > 0).
+    _record_ground(visitor_ip, mode, streaming=False, ok=result.confidence > 0)
 
     return GroundResponse(
         x=result.x,
@@ -208,11 +288,12 @@ async def ground_stream(req: GroundRequest, request: Request):
 
     image = _decode_request_image(req)
     instruction = req.instruction.strip()
+    visitor_ip = _client_ip(request)
 
     # Notify (off-thread, throttled per IP)
     asyncio.create_task(asyncio.to_thread(
         _maybe_notify_ground,
-        _client_ip(request),
+        visitor_ip,
         instruction,
         "fast",
         True,
@@ -248,6 +329,11 @@ async def ground_stream(req: GroundRequest, request: Request):
             "agreement_px": refined.agreement_px,
         }
         yield f"event: refined\ndata: {json.dumps(payload)}\n\n"
+
+        # Record only after the refined pass so /v1/stats counts each
+        # streaming session as a single prediction (matches the sync
+        # endpoint's semantics).
+        _record_ground(visitor_ip, "fast", streaming=True, ok=refined.confidence > 0)
 
     return StreamingResponse(
         generator(),
