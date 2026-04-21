@@ -28,7 +28,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,6 +55,19 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_FROM = os.environ.get("SMTP_FROM", "")
 WAITLIST_NOTIFY_TO = os.environ.get("WAITLIST_NOTIFY_TO", "")
+
+# Notify on /v1/ground* requests too. Use the same SMTP relay as waitlist.
+# Throttled to one email per IP per NOTIFY_GROUND_THROTTLE_S so a visitor
+# doing 20 predictions only emails us once per session, not 20 times.
+NOTIFY_GROUND = os.environ.get("NOTIFY_GROUND", "true").lower() in ("1", "true", "yes")
+NOTIFY_GROUND_THROTTLE_S = int(os.environ.get("NOTIFY_GROUND_THROTTLE_S", "1800"))
+GROUND_NOTIFY_TO = os.environ.get("GROUND_NOTIFY_TO", "") or WAITLIST_NOTIFY_TO
+
+# In-memory per-IP last-notified timestamp. Resets on container restart,
+# which is fine -- the worst case is a duplicate email after a redeploy.
+# For a multi-replica setup this would need to move to Redis; we're at
+# min/max=1 replicas so a Python dict is the right call.
+_LAST_NOTIFIED_AT: dict[str, float] = {}
 
 
 @asynccontextmanager
@@ -139,7 +152,7 @@ def _decode_request_image(req: "GroundRequest") -> Image.Image:
 
 
 @app.post("/v1/ground", response_model=GroundResponse)
-async def ground(req: GroundRequest):
+async def ground(req: GroundRequest, request: Request):
     if engine is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     if not req.instruction.strip():
@@ -147,12 +160,23 @@ async def ground(req: GroundRequest):
 
     image = _decode_request_image(req)
     mode = req.mode or "fast"
+    instruction = req.instruction.strip()
+
+    # Notify (off-thread, throttled per IP) so we get a real-time email
+    # the first time each visitor exercises the API in a session.
+    asyncio.create_task(asyncio.to_thread(
+        _maybe_notify_ground,
+        _client_ip(request),
+        instruction,
+        mode,
+        False,
+        request.headers.get("user-agent", ""),
+    ))
+
     # Run blocking inference off the asyncio thread so the event loop
     # stays responsive (Container Apps multiplexes other healthchecks
     # on the same loop).
-    result = await asyncio.to_thread(
-        engine.predict, image, req.instruction.strip(), mode,
-    )
+    result = await asyncio.to_thread(engine.predict, image, instruction, mode)
 
     return GroundResponse(
         x=result.x,
@@ -166,7 +190,7 @@ async def ground(req: GroundRequest):
 
 
 @app.post("/v1/ground/stream")
-async def ground_stream(req: GroundRequest):
+async def ground_stream(req: GroundRequest, request: Request):
     """Server-Sent Events endpoint: emits the coarse CCF prediction as
     soon as it's ready (~300-500ms warm), then the refined prediction
     when the second pass completes (~600-800ms warm). The playground
@@ -184,6 +208,16 @@ async def ground_stream(req: GroundRequest):
 
     image = _decode_request_image(req)
     instruction = req.instruction.strip()
+
+    # Notify (off-thread, throttled per IP)
+    asyncio.create_task(asyncio.to_thread(
+        _maybe_notify_ground,
+        _client_ip(request),
+        instruction,
+        "fast",
+        True,
+        request.headers.get("user-agent", ""),
+    ))
 
     async def generator():
         # Stage 1: coarse pass
@@ -228,28 +262,20 @@ async def ground_stream(req: GroundRequest):
     )
 
 
-def _send_waitlist_notification(entry: dict) -> Optional[str]:
-    """Send a notification email for a new waitlist entry. Returns None on
-    success or an error message on failure. Never raises -- waitlist
-    persistence to disk happens regardless of email success.
+def _send_email(to: str, subject: str, body: str) -> Optional[str]:
+    """Send a plain-text email via SMTP. Returns None on success or an
+    error string on failure. Never raises.
 
-    Uses SMTP STARTTLS (port 587) by default; if SMTP_PORT is 465 we use
-    implicit SSL. SMTP2GO and most providers support both."""
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and WAITLIST_NOTIFY_TO):
+    Uses SMTP STARTTLS (port 587/2525) by default; if SMTP_PORT is 465
+    we use implicit SSL. SMTP2GO + most providers support both."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and to):
         return "smtp not configured"
 
     msg = EmailMessage()
-    msg["Subject"] = f"GUI-G2-3B waitlist: {entry.get('email', 'unknown')}"
+    msg["Subject"] = subject
     msg["From"] = SMTP_FROM
-    msg["To"] = WAITLIST_NOTIFY_TO
-    body_lines = [
-        f"New waitlist signup at {entry.get('timestamp', '')}",
-        "",
-        f"Email:    {entry.get('email', '')}",
-        f"Company:  {entry.get('company') or '-'}",
-        f"Use case: {entry.get('useCase') or '-'}",
-    ]
-    msg.set_content("\n".join(body_lines))
+    msg["To"] = to
+    msg.set_content(body)
 
     try:
         if SMTP_PORT == 465:
@@ -261,9 +287,6 @@ def _send_waitlist_notification(entry: dict) -> Optional[str]:
             with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
                 s.ehlo()
                 # SMTP2GO and most modern relays support STARTTLS on 587/2525.
-                # Try it; if the server doesn't advertise it we fall back to
-                # plaintext (still authed) -- this matches how mail.smtp2go
-                # works on port 2525.
                 if s.has_extn("starttls"):
                     ctx = ssl.create_default_context()
                     s.starttls(context=ctx)
@@ -273,6 +296,76 @@ def _send_waitlist_notification(entry: dict) -> Optional[str]:
         return None
     except Exception as e:
         return f"smtp error: {type(e).__name__}: {e}"
+
+
+def _send_waitlist_notification(entry: dict) -> Optional[str]:
+    body = "\n".join([
+        f"New waitlist signup at {entry.get('timestamp', '')}",
+        "",
+        f"Email:    {entry.get('email', '')}",
+        f"Company:  {entry.get('company') or '-'}",
+        f"Use case: {entry.get('useCase') or '-'}",
+    ])
+    return _send_email(
+        to=WAITLIST_NOTIFY_TO,
+        subject=f"GUI-G2-3B waitlist: {entry.get('email', 'unknown')}",
+        body=body,
+    )
+
+
+def _client_ip(req: Request) -> str:
+    """Best-effort real visitor IP. uvicorn is started with
+    --proxy-headers --forwarded-allow-ips '*' (see Dockerfile CMD), so
+    request.client.host is already the X-Forwarded-For client when we're
+    behind the Container Apps gateway. We additionally check the header
+    directly as a fallback."""
+    fwd = req.headers.get("x-forwarded-for", "")
+    if fwd:
+        # X-Forwarded-For is a comma-separated list; the leftmost is the
+        # original client.
+        return fwd.split(",")[0].strip()
+    return req.client.host if req.client else "unknown"
+
+
+def _maybe_notify_ground(
+    ip: str,
+    instruction: str,
+    mode: str,
+    streaming: bool,
+    user_agent: str,
+) -> None:
+    """Fire a 'someone tried the playground' email IF this IP hasn't
+    been notified about in NOTIFY_GROUND_THROTTLE_S seconds. Called
+    from the request handler off-thread so it doesn't add latency."""
+    if not NOTIFY_GROUND or not GROUND_NOTIFY_TO:
+        return
+
+    now = time.time()
+    last = _LAST_NOTIFIED_AT.get(ip, 0.0)
+    if now - last < NOTIFY_GROUND_THROTTLE_S:
+        return  # already notified about this IP recently
+    _LAST_NOTIFIED_AT[ip] = now
+
+    # Trim instructions in the email subject to keep things scannable
+    short_instr = instruction[:60] + ("..." if len(instruction) > 60 else "")
+    subj = f"GUI grounding hit: \"{short_instr}\""
+    body = "\n".join([
+        f"Someone just used the live playground.",
+        "",
+        f"IP:          {ip}",
+        f"Instruction: {instruction!r}",
+        f"Mode:        {mode}{' (streaming)' if streaming else ''}",
+        f"User-Agent:  {user_agent[:200]}",
+        f"Time:        {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(now))}",
+        "",
+        f"(Throttled: only one email per IP per {NOTIFY_GROUND_THROTTLE_S // 60} min,",
+        f"so this visitor's subsequent calls in this session will be silent.)",
+    ])
+    err = _send_email(GROUND_NOTIFY_TO, subj, body)
+    if err:
+        print(f"[ground-notify] {ip}: skipped/failed: {err}")
+    else:
+        print(f"[ground-notify] {ip}: notified {GROUND_NOTIFY_TO}")
 
 
 @app.post("/v1/waitlist")

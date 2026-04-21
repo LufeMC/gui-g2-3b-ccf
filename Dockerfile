@@ -40,7 +40,12 @@ RUN mkdir -p /cache/huggingface && chmod -R 777 /cache
 
 EXPOSE 8000
 
-# Override the upstream vllm OpenAI server entrypoint with our FastAPI
+# Override the upstream vllm OpenAI server entrypoint with our FastAPI.
+# --proxy-headers + --forwarded-allow-ips * makes uvicorn trust the
+# X-Forwarded-For header injected by the Container Apps gateway, so
+# request.client.host is the real visitor IP instead of the proxy IP.
 ENTRYPOINT []
 WORKDIR /app/src
-CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python3", "-m", "uvicorn", "server:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--proxy-headers", "--forwarded-allow-ips", "*"]
