@@ -112,9 +112,16 @@ Microsoft Azure Sponsorship subs explicitly disallow Spot pricing. The error
 surfaces as `InvalidTemplateDeployment` with no inner detail. Container Apps
 serverless GPU is the closest equivalent: pay-per-use with scale-to-zero.
 
-## Performance numbers (A100, MAX_PIXELS=1000000)
+## Performance numbers (A100, MAX_PIXELS=800000, COARSE_MAX_PIXELS=600000, max_new_tokens=16)
 
-| Mode | Forward passes | Wall time (warm) | Confidence |
-|---|---|---|---|
-| `fast` | 2 (CCF coarse + refined) | ~6-10s | 0.99 if CCF parse succeeds |
-| `accurate` | 7 (CCF + 3 sampled CCF + native + 0.75x) | ~30-35s | Real agreement-based |
+| Mode | Forward passes | Wall time (warm) | Cost / request | Confidence |
+|---|---|---|---|---|
+| `fast` | 2 (CCF coarse + refined) | **~1.5-2s** | ~$0.0013 | 0.99 if CCF parse succeeds |
+| `accurate` | 7 (CCF + 3 sampled CCF + native + 0.75x) | **~7-9s** | ~$0.005 | Real agreement-based |
+
+Got there from a baseline of 6s / 31s with three changes:
+1. `max_new_tokens 32 -> 16` (bbox is ~12 tokens; capped output cuts ~50% generation time)
+2. `COARSE_MAX_PIXELS 1.5M -> 600k` env var (coarse pass dominates; less pixels = less vision encode work)
+3. `MAX_PIXELS 12M -> 800k` env var (refined crop already small; this caps the worst case)
+
+To push further (sub-1s), the next step is **vLLM with paged attention + continuous batching**. ~2-3x speedup on Qwen2.5-VL but a meaningful re-engineer.

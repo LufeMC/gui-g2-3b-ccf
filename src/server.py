@@ -38,6 +38,7 @@ engine: Optional[GroundingEngine] = None
 MODEL_PATH = os.environ.get("MODEL_PATH", "inclusionAI/GUI-G2-3B")
 ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "")
 MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "12845056"))
+COARSE_MAX_PIXELS = int(os.environ.get("COARSE_MAX_PIXELS", "1500000"))
 WAITLIST_PATH = os.environ.get("WAITLIST_PATH", "data/waitlist.json")
 
 
@@ -49,6 +50,7 @@ async def lifespan(app: FastAPI):
         model_path=MODEL_PATH,
         adapter_path=adapter,
         max_pixels=MAX_PIXELS,
+        coarse_max_pixels=COARSE_MAX_PIXELS,
     )
     yield
     engine = None

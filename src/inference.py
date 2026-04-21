@@ -43,6 +43,10 @@ GUI_G2_PROMPT = (
 DEFAULT_MIN_PIXELS = 3136
 DEFAULT_MAX_PIXELS = 12_845_056
 DEFAULT_COARSE_MAX_PIXELS = 1_500_000
+# Bbox output is "[x1,y1,x2,y2]" -- ~12 tokens. Capping at 16 saves
+# ~50% of generation time vs the original 32 because token-by-token
+# decode dominates VLM grounding latency on short outputs.
+DEFAULT_MAX_NEW_TOKENS = 16
 
 # Thresholds tuned so a perfectly consistent prediction returns ~0.99
 # and a 100px-disagreement prediction returns ~0.4. Floored at 0.2 so
@@ -266,7 +270,11 @@ class GroundingEngine:
             padding=True, return_tensors="pt",
         ).to(self.model.device)
 
-        gen_kwargs = {"max_new_tokens": 32, "do_sample": do_sample}
+        gen_kwargs = {
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+            "do_sample": do_sample,
+            "use_cache": True,
+        }
         if do_sample:
             gen_kwargs["temperature"] = temperature
 
