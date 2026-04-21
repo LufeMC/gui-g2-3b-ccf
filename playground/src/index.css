@@ -1,0 +1,64 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:ital,wght@0,400;0,500;0,600;0,700&display=swap");
+@import "tailwindcss";
+@plugin "tailwindcss-animate";
+
+@theme {
+  --font-sans: "DM Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --color-bg: #f8f7f4;
+  --color-bg-card: #ffffff;
+  --color-bg-elevated: #f1f0ec;
+  --color-border: #e2e0da;
+  --color-border-strong: #d1cfc8;
+  --color-text-primary: #1a1917;
+  --color-text-secondary: #6b6960;
+  --color-text-tertiary: #9c9889;
+  --color-accent: #e63b19;
+  --color-accent-hover: #cc3415;
+  --color-accent-soft: #fef0ed;
+  --color-accent-orange: #e68a19;
+  --color-green: #1a8754;
+  --color-green-soft: #edfaf3;
+  --radius-base: 10px;
+  --radius-lg: 16px;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  height: 100vh;
+}
+
+/* Pulsing dot animation */
+@keyframes pulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.6);
+    opacity: 0.4;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+

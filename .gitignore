@@ -22,11 +22,10 @@ hf_release/
 wandb/
 logs/
 
-# Server / playground / API stuff -- belongs in separate repos
-playground/
-src/server.py
-src/inference.py
-requirements-server.txt
+# Build artifacts inside playground (we DO ship the source, just not the
+# bundle output or installed deps)
+playground/node_modules/
+playground/dist/
 Dockerfile
 
 # Older / unrelated source files (Phase 0-2 artifacts not part of the
