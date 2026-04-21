@@ -46,6 +46,38 @@ function shouldMock(): boolean {
   return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0";
 }
 
+export interface HealthResponse {
+  status: "ok" | "loading" | string;
+  model?: string;
+  modes_supported?: string[];
+}
+
+/**
+ * Ping the API's /health endpoint. Used for two things:
+ *
+ * 1. **Warm-up** -- fire this on page load (from App.tsx) so any
+ *    cold-start cycle begins the moment the visitor lands on the SPA,
+ *    not when they click "Ground" 30 seconds later. By the time they
+ *    upload a screenshot and type an instruction, the model is up.
+ *
+ * 2. **Status check** -- the playground dialog can poll /health while
+ *    a request is pending to surface a transparent "Spinning up GPU"
+ *    message instead of a generic spinner.
+ *
+ * Returns a "503/0" pseudo-status if the API is unreachable so callers
+ * can distinguish "loading" (slow boot) from "down" (network/DNS fail).
+ */
+export async function pingHealth(): Promise<HealthResponse | null> {
+  if (shouldMock()) return { status: "ok", model: "mock", modes_supported: ["fast", "accurate"] };
+  try {
+    const res = await fetch(`${API_BASE}/health`, { method: "GET" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 async function postWithRetry(
   path: string,
   body: unknown,

@@ -1,13 +1,18 @@
 import { useRef, useState, useEffect, useCallback } from "react";
 import { ImageIcon } from "lucide-react";
 import { GroundingDot } from "./GroundingDot";
-import type { GroundingResult } from "@/lib/api";
+import { pingHealth, type GroundingResult } from "@/lib/api";
 
 interface AnnotatedCanvasProps {
   image: string | null;
   result: GroundingResult | null;
   loading: boolean;
 }
+
+// We show a different loading message after this long because anything
+// past it almost certainly means a cold start (warm requests are
+// sub-1s, even with network).
+const COLD_START_THRESHOLD_MS = 2500;
 
 export function AnnotatedCanvas({ image, result, loading }: AnnotatedCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -18,6 +23,26 @@ export function AnnotatedCanvas({ image, result, loading }: AnnotatedCanvasProps
     width: number;
     height: number;
   } | null>(null);
+  const [coldStart, setColdStart] = useState(false);
+
+  // If the request takes more than COLD_START_THRESHOLD_MS without
+  // returning a coarse-stage result, switch the loading copy to the
+  // cold-start explainer + optionally check /health to confirm the
+  // backend is still booting (vs. a network failure).
+  useEffect(() => {
+    if (!loading) {
+      setColdStart(false);
+      return;
+    }
+    const t = window.setTimeout(() => {
+      setColdStart(true);
+      // Best-effort check; we don't actually use the result, but firing
+      // the request now also helps the cold-start replica wake up if
+      // it hadn't been pinged in a while.
+      void pingHealth();
+    }, COLD_START_THRESHOLD_MS);
+    return () => window.clearTimeout(t);
+  }, [loading]);
 
   const updateBounds = useCallback(() => {
     const container = containerRef.current;
@@ -110,10 +135,32 @@ export function AnnotatedCanvas({ image, result, loading }: AnnotatedCanvasProps
             user sees their answer immediately.
       */}
       {loading && !result && (
-        <div className="absolute inset-0 flex items-center justify-center bg-bg-card/80 backdrop-blur-sm rounded-[var(--radius-lg)]">
-          <div className="flex items-center gap-2 font-mono text-[0.78rem] text-text-secondary">
-            <div className="w-[15px] h-[15px] border-2 border-border border-t-accent rounded-full animate-[spin_0.7s_linear_infinite]" />
-            Running inference&hellip;
+        <div className="absolute inset-0 flex items-center justify-center bg-bg-card/85 backdrop-blur-sm rounded-[var(--radius-lg)] p-6">
+          <div className="flex flex-col items-center gap-3 max-w-[320px] text-center">
+            <div className="w-[18px] h-[18px] border-2 border-border border-t-accent rounded-full animate-[spin_0.7s_linear_infinite]" />
+            {coldStart ? (
+              <>
+                <div className="font-mono text-[0.82rem] font-semibold text-text-primary">
+                  Spinning up GPU&hellip;
+                </div>
+                <div className="font-mono text-[0.7rem] leading-relaxed text-text-secondary">
+                  This takes ~90 seconds the first time after idle. We scale to
+                  zero between sessions to keep this demo open and free.
+                </div>
+                <a
+                  href="https://github.com/LufeMC/gui-g2-3b-ccf"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-mono text-[0.66rem] underline text-text-tertiary hover:text-accent"
+                >
+                  The model is open source &mdash; run it always-on yourself
+                </a>
+              </>
+            ) : (
+              <div className="font-mono text-[0.82rem] text-text-secondary">
+                Running inference&hellip;
+              </div>
+            )}
           </div>
         </div>
       )}

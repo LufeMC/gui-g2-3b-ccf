@@ -19,8 +19,11 @@ import asyncio
 import base64
 import json
 import os
+import smtplib
+import ssl
 import time
 from contextlib import asynccontextmanager
+from email.message import EmailMessage
 from io import BytesIO
 from pathlib import Path
 from typing import Literal, Optional
@@ -41,6 +44,17 @@ ADAPTER_PATH = os.environ.get("ADAPTER_PATH", "")
 MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "12845056"))
 COARSE_MAX_PIXELS = int(os.environ.get("COARSE_MAX_PIXELS", "1500000"))
 WAITLIST_PATH = os.environ.get("WAITLIST_PATH", "data/waitlist.json")
+
+# SMTP for /v1/waitlist email notifications. All optional -- if SMTP_HOST
+# is unset we just persist to disk and skip the email (useful for local
+# dev). Credentials should come from Container Apps secrets, never from
+# checked-in files.
+SMTP_HOST = os.environ.get("SMTP_HOST", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587") or "587")
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+SMTP_FROM = os.environ.get("SMTP_FROM", "")
+WAITLIST_NOTIFY_TO = os.environ.get("WAITLIST_NOTIFY_TO", "")
 
 
 @asynccontextmanager
@@ -214,6 +228,53 @@ async def ground_stream(req: GroundRequest):
     )
 
 
+def _send_waitlist_notification(entry: dict) -> Optional[str]:
+    """Send a notification email for a new waitlist entry. Returns None on
+    success or an error message on failure. Never raises -- waitlist
+    persistence to disk happens regardless of email success.
+
+    Uses SMTP STARTTLS (port 587) by default; if SMTP_PORT is 465 we use
+    implicit SSL. SMTP2GO and most providers support both."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and SMTP_FROM and WAITLIST_NOTIFY_TO):
+        return "smtp not configured"
+
+    msg = EmailMessage()
+    msg["Subject"] = f"GUI-G2-3B waitlist: {entry.get('email', 'unknown')}"
+    msg["From"] = SMTP_FROM
+    msg["To"] = WAITLIST_NOTIFY_TO
+    body_lines = [
+        f"New waitlist signup at {entry.get('timestamp', '')}",
+        "",
+        f"Email:    {entry.get('email', '')}",
+        f"Company:  {entry.get('company') or '-'}",
+        f"Use case: {entry.get('useCase') or '-'}",
+    ]
+    msg.set_content("\n".join(body_lines))
+
+    try:
+        if SMTP_PORT == 465:
+            ctx = ssl.create_default_context()
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=10) as s:
+                s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as s:
+                s.ehlo()
+                # SMTP2GO and most modern relays support STARTTLS on 587/2525.
+                # Try it; if the server doesn't advertise it we fall back to
+                # plaintext (still authed) -- this matches how mail.smtp2go
+                # works on port 2525.
+                if s.has_extn("starttls"):
+                    ctx = ssl.create_default_context()
+                    s.starttls(context=ctx)
+                    s.ehlo()
+                s.login(SMTP_USER, SMTP_PASS)
+                s.send_message(msg)
+        return None
+    except Exception as e:
+        return f"smtp error: {type(e).__name__}: {e}"
+
+
 @app.post("/v1/waitlist")
 async def waitlist(req: WaitlistRequest):
     entry = {
@@ -222,15 +283,31 @@ async def waitlist(req: WaitlistRequest):
         "useCase": req.useCase,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    # Persist to disk first so we never lose a signup, even if the SMTP
+    # call later fails.
     path = Path(WAITLIST_PATH)
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = []
     if path.exists():
-        with open(path) as f:
-            entries = json.load(f)
+        try:
+            with open(path) as f:
+                entries = json.load(f)
+        except Exception:
+            entries = []  # corrupted; we'll overwrite
     entries.append(entry)
     with open(path, "w") as f:
         json.dump(entries, f, indent=2)
+
+    # Fire the email off the request thread so the client doesn't wait
+    # on SMTP. Errors are logged but don't fail the request.
+    async def _notify():
+        err = await asyncio.to_thread(_send_waitlist_notification, entry)
+        if err:
+            print(f"[waitlist] notification skipped/failed: {err}")
+        else:
+            print(f"[waitlist] notified {WAITLIST_NOTIFY_TO} for {entry['email']}")
+
+    asyncio.create_task(_notify())
     return {"status": "ok"}
 
 
