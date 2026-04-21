@@ -36,9 +36,33 @@ export function AnnotatedCanvas({ image, result, loading }: AnnotatedCanvasProps
   }, []);
 
   useEffect(() => {
+    // Re-measure on every layout change of either the container or the
+    // image itself. This catches:
+    //   - dialog zoom-in animation finishing after onLoad fired
+    //   - sibling pane resize (e.g. ResultCard expanding)
+    //   - DevTools opening/closing (was relying on window resize alone)
+    //   - flexbox/grid reflow after image natural size is known
+    // Without this the dot can land off the image until the user does
+    // *something* that triggers a window resize.
     updateBounds();
     window.addEventListener("resize", updateBounds);
-    return () => window.removeEventListener("resize", updateBounds);
+
+    const ro = new ResizeObserver(() => updateBounds());
+    if (containerRef.current) ro.observe(containerRef.current);
+    if (imgRef.current) ro.observe(imgRef.current);
+
+    // Also re-measure across the next animation frame (catches the
+    // post-zoom-in steady state) and after a short delay (catches any
+    // last reflow from font/asset loads).
+    const raf = requestAnimationFrame(updateBounds);
+    const timeout = window.setTimeout(updateBounds, 250);
+
+    return () => {
+      window.removeEventListener("resize", updateBounds);
+      ro.disconnect();
+      cancelAnimationFrame(raf);
+      window.clearTimeout(timeout);
+    };
   }, [updateBounds, image]);
 
   return (
