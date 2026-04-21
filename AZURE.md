@@ -125,3 +125,25 @@ Got there from a baseline of 6s / 31s with three changes:
 3. `MAX_PIXELS 12M -> 800k` env var (refined crop already small; this caps the worst case)
 
 To push further (sub-1s), the next step is **vLLM with paged attention + continuous batching**. ~2-3x speedup on Qwen2.5-VL but a meaningful re-engineer.
+
+## vLLM attempt (deferred, April 2026)
+
+We tried swapping the HF transformers backend for vLLM (versions 0.7.3, 0.8.5) targeting sub-1s fast mode and ~2s accurate mode via batching the 7-pass self-consistency loop into 3 batched calls. Build + deploy worked; **vLLM/transformers compat for Qwen2.5-VL bit us hard**:
+
+| Attempt | Stack | Failure |
+|---|---|---|
+| v6 | `vllm==0.7.3` + auto-bundled transformers (4.49+) | `Qwen2Tokenizer has no attribute all_special_tokens_extended` |
+| v7 | `vllm==0.7.3 + transformers==4.48.3` | `KeyError: 'qwen2_5_vl'` -- model_type only added in 4.49+ |
+| v8 | `vllm==0.8.5` (auto transformers) | Same `all_special_tokens_extended` error in newer engine |
+| v9 | `vllm==0.8.5` + monkeypatch for the missing attr | `'Qwen2VLImageProcessor' object has no attribute 'min_pixels'` -- yet another version mismatch in the multimodal init path |
+
+After 4 build/deploy iterations and ~15 minutes per cycle, we rolled back to v5 (HF transformers, 1.5-2s warm). The HF backend is "good enough" for the demo; vLLM would need a known-good pinned combination of `vllm`, `transformers`, AND `qwen-vl-utils`, which moves with each vLLM release. Worth revisiting once vLLM ships a stable Qwen2.5-VL recipe (their docs reference one but it's currently underspecified for version pins).
+
+**Things to try next time** (in priority order):
+
+1. Use vLLM's official Docker image (`vllm/vllm-openai:vX.Y.Z`) instead of building our own -- they pin the entire stack.
+2. Try the brand-new vLLM (>=0.9.x) which has reportedly fixed the multimodal processor compat issues.
+3. Accept the cold-start hit and pre-warm CUDA graphs for our specific image shapes (the variable image sizes mean vLLM can't fully reuse graphs anyway).
+4. Skip vLLM entirely; integrate `torch.compile()` on the HF model for ~30% speedup with much less compat risk.
+
+The committed code (the v5 HF backend) is what's actually running. The vLLM-rewrite branch was discarded after rollback to keep the deployable surface single-track.
