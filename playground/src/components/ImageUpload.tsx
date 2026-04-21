@@ -2,6 +2,29 @@ import { useCallback, useRef, useState } from "react";
 import { Upload } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+async function downscaleIfNeeded(dataUrl: string, maxPixels: number): Promise<string> {
+  const img = new Image();
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve();
+    img.onerror = () => reject(new Error("img load failed"));
+    img.src = dataUrl;
+  });
+  const total = img.naturalWidth * img.naturalHeight;
+  if (!total || total <= maxPixels) return dataUrl;
+  const scale = Math.sqrt(maxPixels / total);
+  const w = Math.max(1, Math.round(img.naturalWidth * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return dataUrl;
+  ctx.drawImage(img, 0, 0, w, h);
+  // Use JPEG for ~3-5x smaller payload than PNG; quality 0.9 preserves
+  // UI text legibility for the demo.
+  return canvas.toDataURL("image/jpeg", 0.9);
+}
+
 interface ImageUploadProps {
   image: string | null;
   onImageSelected: (dataUrl: string) => void;
@@ -15,7 +38,14 @@ export function ImageUpload({ image, onImageSelected }: ImageUploadProps) {
     (file: File) => {
       const reader = new FileReader();
       reader.onload = (e) => {
-        if (e.target?.result) onImageSelected(e.target.result as string);
+        const dataUrl = e.target?.result as string | undefined;
+        if (!dataUrl) return;
+        // Downscale very large screenshots before sending to the API.
+        // Anything over ~1.5M pixels (1500x1000) provides no accuracy
+        // benefit for grounding and adds 5-25s of latency on T4/A100.
+        downscaleIfNeeded(dataUrl, 1_500_000)
+          .then(onImageSelected)
+          .catch(() => onImageSelected(dataUrl));
       };
       reader.readAsDataURL(file);
     },

@@ -26,7 +26,6 @@ logs/
 # bundle output or installed deps)
 playground/node_modules/
 playground/dist/
-Dockerfile
 
 # Older / unrelated source files (Phase 0-2 artifacts not part of the
 # Phase 4-9 published work; intentionally left out of the public repo).

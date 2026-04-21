@@ -28,6 +28,8 @@ from typing import List, Optional, Tuple
 
 from PIL import Image
 
+from cursor_ccf import CCFConfig, ccf_predict_bbox
+
 # Heavy imports (torch, transformers, peft, qwen_vl_utils) are deferred
 # to GroundingEngine.__init__ so the helper functions and dataclasses
 # in this module can be imported (and unit-tested) on machines that
@@ -198,7 +200,14 @@ class GroundingEngine:
         self.coarse_max_pixels = coarse_max_pixels
 
         use_cpu = device == "cpu"
-        dtype = torch.float32 if use_cpu else torch.bfloat16
+        # bfloat16 is only fast on Ampere+ (SM 8.0+). On Turing (T4, SM 7.5)
+        # bf16 silently falls back to fp32 emulation -- ~2x slower AND ~2x
+        # memory. Detect compute capability and pick fp16 there.
+        if use_cpu:
+            dtype = torch.float32
+        else:
+            major = torch.cuda.get_device_capability()[0] if torch.cuda.is_available() else 8
+            dtype = torch.bfloat16 if major >= 8 else torch.float16
         device_map = "cpu" if use_cpu else "auto"
         if attn_impl is None:
             attn_impl = "eager" if use_cpu else "sdpa"
@@ -316,6 +325,18 @@ class GroundingEngine:
     ) -> GroundingResult:
         if mode not in ("fast", "accurate"):
             raise ValueError(f"unknown mode: {mode!r}")
+        # Defensive downscale: smart_resize inside the processor occasionally
+        # over-allocates patches for very large inputs. Cap the input image
+        # at ~1.5M pixels (roughly 1500x1000) before any model work; this is
+        # well above the resolution needed for accurate grounding and keeps
+        # latency on T4/A100 in the single-digit seconds.
+        max_input_px = 1_500_000
+        w, h = image.size
+        if w * h > max_input_px:
+            scale = (max_input_px / (w * h)) ** 0.5
+            new_w = max(1, int(w * scale))
+            new_h = max(1, int(h * scale))
+            image = image.resize((new_w, new_h), Image.LANCZOS)
         start = time.perf_counter()
         if mode == "fast":
             xy, raw, _stage, n_passes, passes = self._fast(image, instruction)
