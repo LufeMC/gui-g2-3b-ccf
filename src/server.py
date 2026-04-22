@@ -18,12 +18,14 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import smtplib
 import ssl
 import threading
 import time
+import urllib.request
 from collections import deque
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
@@ -399,6 +401,54 @@ def _send_waitlist_notification(entry: dict) -> Optional[str]:
     )
 
 
+# Reserved / non-routable / our-own ranges that can never be a real
+# visitor. Catches RFC 5737 TEST-NET, RFC 6598 carrier-grade NAT (the
+# Container Apps gateway sits in 100.x.x.x), and a few defensive picks
+# in case Python's is_private misses something on the running version.
+_TEST_NETS = [
+    ipaddress.ip_network("192.0.2.0/24"),     # TEST-NET-1
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2
+    ipaddress.ip_network("203.0.113.0/24"),   # TEST-NET-3
+    ipaddress.ip_network("100.64.0.0/10"),    # CGN (Container Apps gateway lives here)
+]
+
+
+def _is_test_or_private_ip(ip: str) -> bool:
+    """Return True for any IP that can't be a real visitor: malformed,
+    unknown, RFC 5737 TEST-NET, private (RFC 1918), CGN (100.64/10),
+    loopback, link-local, or the 1.2.3.4 / 5.6.7.8 sentinels we use
+    in our own smoke tests."""
+    if ip in ("", "unknown", "1.2.3.4", "5.6.7.8"):
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    if (addr.is_private or addr.is_loopback or
+            addr.is_link_local or addr.is_multicast or addr.is_unspecified):
+        return True
+    return any(addr in net for net in _TEST_NETS)
+
+
+def _lookup_geo(ip: str) -> dict:
+    """Best-effort city/country/ISP lookup via ip-api.com (free tier:
+    no key, ~45 req/min, HTTP only). Returns an empty dict on any
+    failure (network, parse, rate limit) -- never raises."""
+    try:
+        url = (
+            f"http://ip-api.com/json/{ip}"
+            "?fields=status,country,countryCode,regionName,city,isp,org,query"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "gui-grounding-notify/1"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("status") == "success":
+            return data
+    except Exception:
+        pass
+    return {}
+
+
 def _client_ip(req: Request) -> str:
     """Best-effort real visitor IP. uvicorn is started with
     --proxy-headers --forwarded-allow-ips '*' (see Dockerfile CMD), so
@@ -420,38 +470,65 @@ def _maybe_notify_ground(
     streaming: bool,
     user_agent: str,
 ) -> None:
-    """Fire a 'someone tried the playground' email IF this IP hasn't
-    been notified about in NOTIFY_GROUND_THROTTLE_S seconds. Called
-    from the request handler off-thread so it doesn't add latency."""
+    """Fire a 'someone tried the playground' email IF the IP is real
+    AND hasn't been notified about in NOTIFY_GROUND_THROTTLE_S seconds.
+
+    Skipped silently for our own smoke-test IPs (TEST-NET, private,
+    1.2.3.4 / 5.6.7.8) -- we don't want to spam our inbox while
+    iterating on the API.
+
+    Called from the request handler off-thread so it doesn't add
+    latency. Geo lookup is a separate ~100ms HTTP call to ip-api.com,
+    safe in this thread context."""
     if not NOTIFY_GROUND or not GROUND_NOTIFY_TO:
+        return
+    if _is_test_or_private_ip(ip):
+        print(f"[ground-notify] {ip}: skipped (test/private IP)")
         return
 
     now = time.time()
     last = _LAST_NOTIFIED_AT.get(ip, 0.0)
     if now - last < NOTIFY_GROUND_THROTTLE_S:
-        return  # already notified about this IP recently
+        return
     _LAST_NOTIFIED_AT[ip] = now
 
-    # Trim instructions in the email subject to keep things scannable
-    short_instr = instruction[:60] + ("..." if len(instruction) > 60 else "")
-    subj = f"GUI grounding hit: \"{short_instr}\""
+    geo = _lookup_geo(ip)
+    location_parts = [p for p in (geo.get("city"), geo.get("regionName"),
+                                  geo.get("country")) if p]
+    location = ", ".join(location_parts)
+    isp = geo.get("isp") or geo.get("org") or "unknown ISP"
+
+    # Subject leads with location + ISP so you can triage from the
+    # notification preview without opening the email.
+    short_instr = instruction[:50] + ("..." if len(instruction) > 50 else "")
+    if location_parts:
+        subj_loc = f"{location_parts[0]} - {isp}"
+    else:
+        subj_loc = ip
+    subj = f"GUI grounding hit ({subj_loc}): \"{short_instr}\""
+
     body = "\n".join([
-        f"Someone just used the live playground.",
+        "Someone just used the live playground.",
         "",
-        f"IP:          {ip}",
         f"Instruction: {instruction!r}",
         f"Mode:        {mode}{' (streaming)' if streaming else ''}",
-        f"User-Agent:  {user_agent[:200]}",
+        "",
+        f"IP:          {ip}",
+        f"Location:    {location or 'unknown'}",
+        f"ISP / Org:   {isp}" + (
+            f" / {geo.get('org')}" if geo.get("org") and geo.get("org") != isp else ""
+        ),
+        f"User-Agent:  {user_agent[:200] or 'unknown'}",
         f"Time:        {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(now))}",
         "",
-        f"(Throttled: only one email per IP per {NOTIFY_GROUND_THROTTLE_S // 60} min,",
+        f"(Throttled: only one email per IP per {NOTIFY_GROUND_THROTTLE_S // 60} min, "
         f"so this visitor's subsequent calls in this session will be silent.)",
     ])
     err = _send_email(GROUND_NOTIFY_TO, subj, body)
     if err:
         print(f"[ground-notify] {ip}: skipped/failed: {err}")
     else:
-        print(f"[ground-notify] {ip}: notified {GROUND_NOTIFY_TO}")
+        print(f"[ground-notify] {ip}: notified {GROUND_NOTIFY_TO} ({location or 'no geo'})")
 
 
 @app.post("/v1/waitlist")
